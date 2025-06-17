@@ -1,0 +1,6 @@
+*.pdf
+.env
+.venv
+infos
+*.ipynb
+*.docx
