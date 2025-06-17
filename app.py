@@ -8,11 +8,13 @@ from collections import Counter
 from openai import OpenAI
 import os
 import json
+import requests
 from dotenv import load_dotenv
+import re
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # Defina essa variável no .env
 
 # Função para extrair as páginas de um PDF com base nos IDs relevantes
 def extrair_paginas_relevantes(caminho_pdf: str, ids_validos: List[str]):
@@ -24,7 +26,7 @@ def extrair_paginas_relevantes(caminho_pdf: str, ids_validos: List[str]):
 
     for i, pagina in enumerate(doc):
         texto = pagina.get_text("text")
-        for linha in texto.splitlines()[::-1]:  # varre de baixo pra cima
+        for linha in texto.splitlines()[::-1]:
             if "num." in linha.lower():
                 try:
                     partes = linha.lower().split("num.")
@@ -45,7 +47,6 @@ def extrair_paginas_relevantes(caminho_pdf: str, ids_validos: List[str]):
     novo_pdf.close()
     doc.close()
 
-    # Contagem de quantas vezes cada ID foi encontrado
     contagem_ids = Counter(ids_encontrados)
     df_contagem = pd.DataFrame(contagem_ids.items(), columns=["ID", "Quantidade de Páginas"])
     df_contagem = df_contagem.reset_index(drop=True)
@@ -66,9 +67,9 @@ Você receberá abaixo o conteúdo da primeira página de um processo jurídico.
 - partes (com subcampos: autor e reu)
 
 Texto da primeira página:
-\"\"\"
+
 {texto}
-\"\"\"
+
 
 Retorne somente o JSON.
 """
@@ -84,7 +85,6 @@ Retorne somente o JSON.
 
     conteudo = resposta.choices[0].message.content
 
-    # 🔧 Remove blocos markdown se existirem
     if conteudo.startswith("```json"):
         conteudo = conteudo.strip("`").replace("json", "", 1).strip()
     elif conteudo.startswith("```"):
@@ -94,6 +94,27 @@ Retorne somente o JSON.
         return json.loads(conteudo)
     except Exception:
         return {"erro": "Não foi possível interpretar o JSON gerado.", "resposta": conteudo}
+
+
+def limpar_cabecalho_pje(texto: str) -> str:
+    linhas = texto.strip().splitlines()
+
+    # Define padrões que representam as linhas padrão do cabeçalho
+    padroes_remover = [
+        r"^num\.\s*\d+\s*-\s*p[áa]g\.\s*\d+",  # ex: Num. 3610332 - Pág. 1
+        r"^assinado eletronicamente por:.*",
+        r"^https:\/\/.*",
+        r"^n[úu]mero do documento:.*",
+        r"^este documento foi gerado pelo usu[áa]rio.*"
+    ]
+
+    linhas_filtradas = []
+    for linha in linhas:
+        linha_normalizada = linha.strip().lower()
+        if not any(re.match(p, linha_normalizada) for p in padroes_remover):
+            linhas_filtradas.append(linha)
+
+    return "\n".join(linhas_filtradas).strip()
 
 
 st.set_page_config(page_title="Monteiro - Projeto Judiciário", layout="wide")
@@ -106,10 +127,11 @@ if uploaded_file is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(uploaded_file.read())
         temp_pdf_path = tmp_file.name
+        uploaded_file.seek(0)  # Reseta o ponteiro para reuso posterior
+        pdf_bytes = uploaded_file.read()
 
-        total_paginas_pdf = fitz.open(temp_pdf_path).page_count
+    total_paginas_pdf = fitz.open(temp_pdf_path).page_count
 
-    # Etapa 0: Extrair informações da primeira página com IA
     with fitz.open(temp_pdf_path) as doc:
         texto_primeira_pagina = doc[0].get_text()
 
@@ -121,80 +143,55 @@ if uploaded_file is not None:
     st.divider()
 
     try:
-        # Lista para juntar todos os DataFrames de tabelas
         tabelas_total = []
         max_paginas = 50
-
-        # tabula.read_pdf permite especificar as páginas (1-indexed)
         paginas = list(range(1, max_paginas + 1))
         todas_tabelas = tabula.read_pdf(
             temp_pdf_path,
             pages=paginas,
             multiple_tables=True,
             guess=True,
-            lattice=True,  # Melhora a detecção para PDFs mais "quadrados"
+            lattice=True,
             pandas_options={"dtype": str}
         )
 
         for tabela in todas_tabelas:
-            # Se a tabela está vazia, pula
             if tabela.empty or tabela.shape[1] < 3:
                 continue
-            # Tenta detectar e ajustar cabeçalho real
             primeira_linha = tabela.iloc[0].astype(str).str.lower().str.contains("id") | tabela.iloc[0].astype(str).str.contains("assinatura")
             if primeira_linha.any():
                 tabela.columns = ['ID', 'Data da Assinatura', 'Documento', 'Tipo'][:len(tabela.columns)]
-                tabela = tabela.iloc[1:]  # Remove a linha de cabeçalho
+                tabela = tabela.iloc[1:]
             else:
                 tabela.columns = ['ID', 'Data da Assinatura', 'Documento', 'Tipo'][:len(tabela.columns)]
             tabelas_total.append(tabela)
 
         if tabelas_total:
             df_final = pd.concat(tabelas_total, ignore_index=True)
-            # Limpa quebras de linha em datas
             df_final["Data da Assinatura"] = df_final["Data da Assinatura"].str.replace("\n", " ", regex=True)
-            
-            # --------- Adiciona coluna Documento Válido ---------
+
             tipos_validos = [
-                "Petição inicial",
-                "Inicial",
-                "Despacho",
-                "Emenda à inicial",
-                "Citação",
-                "Contestação",
-                "Petição Intercorrente",
-                "Réplica",
-                "Decisão",
-                "Sentença",
-                "Acórdão"
+                "Petição inicial", "Inicial", "Despacho", "Emenda à inicial", "Citação",
+                "Contestação", "Petição Intercorrente", "Réplica", "Decisão", "Sentença", "Acórdão"
             ]
             def documento_valido(tipo):
-                if pd.isnull(tipo):
-                    return "Não"
+                if pd.isnull(tipo): return "Não"
                 tipo = tipo.strip().lower()
                 return "Sim" if any(tipo == valido.lower() for valido in tipos_validos) else "Não"
             df_final["Documento Válido"] = df_final["Tipo"].apply(documento_valido)
 
-            # --------- Gera lista de IDs válidos ---------
             ids_validos = df_final[df_final["Documento Válido"] == "Sim"]["ID"].dropna().tolist()
 
-            # -----------------------------------------------------
-
-            # ---- Destacar "Sim" na coluna Documento Válido ----
             def highlight_sim(val):
-                color = 'background-color: #2B915D' if val == "Sim" else ''
-                return color
+                return 'background-color: #2B915D' if val == "Sim" else ''
             df_final_styled = df_final.style.applymap(highlight_sim, subset=["Documento Válido"])
 
             st.success("✅ Todas as tabelas extraídas com sucesso!")
             with st.expander("Etapa 1: Mostrar tabela extraída (clique para expandir/ocultar)"):
-                
                 st.info(f"📄 Total de páginas no PDF: **{total_paginas_pdf}**")
                 st.info(f"🧾 Total de documentos distintos: **{df_final['ID'].nunique()}**")
-
                 st.dataframe(df_final_styled, use_container_width=True)
 
-                # Botão para baixar CSV
                 csv = df_final.to_csv(index=False).encode("utf-8")
                 st.download_button("Baixar como CSV", data=csv, file_name="tabelas_extraidas.csv", mime="text/csv")
 
@@ -205,13 +202,10 @@ if uploaded_file is not None:
                 if ids_validos:
                     try:
                         caminho_pdf_filtrado, total_paginas, total_ids, df_contagem = extrair_paginas_relevantes(temp_pdf_path, ids_validos)
-
                         st.info(f"📄 Total de páginas no novo PDF: **{total_paginas}**")
                         st.info(f"🧾 Total de documentos distintos: **{total_ids}**")
-
                         st.markdown("### 📊 Distribuição de páginas por ID")
                         st.dataframe(df_contagem, use_container_width=True)
-
                         with open(caminho_pdf_filtrado, "rb") as f:
                             st.download_button(
                                 label="📥 Baixar PDF filtrado",
@@ -223,6 +217,87 @@ if uploaded_file is not None:
                         st.error(f"❌ {e}")
                 else:
                     st.warning("Nenhum ID válido identificado para filtrar o PDF.")
+
+            with st.expander("Etapa 4: Enviar dados do PDF filtrado para o N8N"):
+                if "caminho_pdf_filtrado" in locals():
+                    if st.button("🚀 Enviar PDF filtrado para o N8N"):
+                        try:
+                            doc_filtrado = fitz.open(caminho_pdf_filtrado)
+                            linhas = []
+
+                            for i, pagina in enumerate(doc_filtrado):
+                                texto_original = pagina.get_text("text")
+                                texto_limpo = limpar_cabecalho_pje(texto_original)
+
+                                id_encontrado = None
+                                tipo_documento = None
+
+                                for linha in texto_original.splitlines()[::-1]:
+                                    if "num." in linha.lower():
+                                        try:
+                                            partes = linha.lower().split("num.")
+                                            id_texto = partes[1].strip().split()[0]
+                                            id_encontrado = id_texto
+                                            break
+                                        except:
+                                            continue
+
+                                if id_encontrado:
+                                    tipo_documento = df_final.loc[
+                                        df_final["ID"] == id_encontrado, "Tipo"
+                                    ].dropna().astype(str).values
+                                    tipo_documento = tipo_documento[0] if len(tipo_documento) else None
+
+                                linhas.append({
+                                    "pagina": i + 1,
+                                    "conteudo": texto_limpo + " ||||| ",
+                                    "id_documento": id_encontrado,
+                                    "tipo_documento": tipo_documento
+                                })
+
+                            df_paginas_filtradas = pd.DataFrame(linhas)
+
+                            st.success("✅ Tabela com as páginas do PDF filtrado gerada com sucesso!")
+                            st.dataframe(df_paginas_filtradas, use_container_width=True)
+
+                            dados = {
+                                "dados_cabecalho": json.dumps(dados_extraidos),
+                                "tabela_paginas_filtradas": json.dumps(df_paginas_filtradas.to_dict(orient="records"))
+                            }
+
+                            resposta = requests.post(N8N_WEBHOOK_URL, data=dados)
+                            if resposta.status_code == 200:
+                                st.success("✅ Dados do PDF filtrado enviados com sucesso para o N8N!")
+                            else:
+                                st.error(f"❌ Erro ao enviar para o N8N: {resposta.text}")
+
+                        except Exception as e:
+                            st.error(f"❌ Falha na geração ou envio da tabela: {e}")
+                else:
+                    st.warning("⚠️ Você precisa primeiro gerar o PDF filtrado na Etapa 3.")
+
+            with st.expander("Etapa 5: Executar Análise via N8N"):
+                if st.button("📡 Chamar N8N e exibir resposta"):
+                    try:
+                        with st.spinner("Aguardando resposta do N8N..."):
+                            resposta = requests.post(os.getenv("N8N_WEBHOOK_URL_2"))
+                            if resposta.status_code == 200:
+                                st.success("✅ Resposta recebida com sucesso!")
+
+                                try:
+                                    dados = resposta.json()
+                                    relatorio = dados.get("relatorio") or resposta.text
+                                except:
+                                    relatorio = resposta.text
+
+                                st.markdown("### 🧾 Relatório Gerado")
+                                st.markdown(relatorio, unsafe_allow_html=True)
+
+                            else:
+                                st.error(f"❌ Erro na requisição: {resposta.status_code}")
+                                st.text(resposta.text)
+                    except Exception as e:
+                        st.error(f"❌ Falha na comunicação com o N8N: {e}")
 
         else:
             st.warning("⚠️ Nenhuma tabela encontrada nas primeiras 50 páginas.")
