@@ -11,6 +11,7 @@ import json
 import requests
 from dotenv import load_dotenv
 import re
+import pdfplumber
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -145,26 +146,38 @@ if uploaded_file is not None:
     try:
         tabelas_total = []
         max_paginas = 50
-        paginas = list(range(1, max_paginas + 1))
-        todas_tabelas = tabula.read_pdf(
-            temp_pdf_path,
-            pages=paginas,
-            multiple_tables=True,
-            guess=True,
-            lattice=True,
-            pandas_options={"dtype": str}
-        )
 
-        for tabela in todas_tabelas:
-            if tabela.empty or tabela.shape[1] < 3:
-                continue
-            primeira_linha = tabela.iloc[0].astype(str).str.lower().str.contains("id") | tabela.iloc[0].astype(str).str.contains("assinatura")
-            if primeira_linha.any():
-                tabela.columns = ['ID', 'Data da Assinatura', 'Documento', 'Tipo'][:len(tabela.columns)]
-                tabela = tabela.iloc[1:]
-            else:
-                tabela.columns = ['ID', 'Data da Assinatura', 'Documento', 'Tipo'][:len(tabela.columns)]
-            tabelas_total.append(tabela)
+        todas_tabelas = []
+
+        with pdfplumber.open(temp_pdf_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                if i >= max_paginas:
+                    break
+                try:
+                    tabelas_na_pagina = page.extract_tables()
+                    for tabela_raw in tabelas_na_pagina:
+                        df = pd.DataFrame(tabela_raw)
+
+                        # Ignora tabelas vazias ou com menos de 3 colunas
+                        if df.empty or df.shape[1] < 3:
+                            continue
+
+                        # Padroniza colunas
+                        primeira_linha = df.iloc[0].astype(str).str.lower().str.contains("id") | df.iloc[0].astype(str).str.contains("assinatura")
+                        if primeira_linha.any():
+                            df.columns = ['ID', 'Data da Assinatura', 'Documento', 'Tipo'][:len(df.columns)]
+                            df = df.iloc[1:]  # Remove cabeçalho duplicado
+                        else:
+                            df.columns = ['ID', 'Data da Assinatura', 'Documento', 'Tipo'][:len(df.columns)]
+
+                        # Filtra somente linhas com ID numérico
+                        df['ID'] = df['ID'].astype(str)
+                        df = df[df['ID'].str.isnumeric()]
+
+                        if not df.empty:
+                            tabelas_total.append(df)
+                except Exception:
+                    continue
 
         if tabelas_total:
             df_final = pd.concat(tabelas_total, ignore_index=True)
