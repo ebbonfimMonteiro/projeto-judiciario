@@ -5,4 +5,3 @@ fitz==0.0.1.dev2
 openai==1.88.0
 requests==2.32.4
 python-dotenv==1.1.0
-frontend==0.0.3
