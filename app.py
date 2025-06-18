@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import tabula
+# import tabula
 import tempfile
 import fitz  # PyMuPDF
 from typing import List
