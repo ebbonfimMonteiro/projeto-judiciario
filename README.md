@@ -1,6 +1,6 @@
 # 📄 Monteiro - Projeto Judiciário
 
-Este projeto é uma aplicação Streamlit voltada para a extração e análise de dados jurídicos a partir de arquivos PDF. Ele realiza a extração de informações de tabelas, identifica documentos válidos e utiliza inteligência artificial (OpenAI) para extrair os principais dados da primeira página do processo.
+Este projeto é uma aplicação Python com Streamlit voltada para a extração e análise de dados jurídicos a partir de arquivos PDF. Ele realiza a extração de informações de tabelas, identifica documentos válidos e utiliza inteligência artificial (OpenAI) para extrair os principais dados da primeira página do processo.
 
 ---
 
