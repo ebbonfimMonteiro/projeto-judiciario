@@ -1,7 +1,7 @@
 streamlit==1.46.0
 pandas==2.3.0
 tabula-py==2.10.0
-fitz==0.0.1.dev2
+PyMuPDF==1.26.1
 openai==1.88.0
 requests==2.32.4
 python-dotenv==1.1.0
